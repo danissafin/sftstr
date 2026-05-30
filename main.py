@@ -315,91 +315,42 @@ async def check_product_keys(keys: list[str]) -> dict:
             return await response.json(content_type=None)
 
 
-def format_pidms_response(data) -> str:
-    def get_value(item: dict, *names, default=""):
-        for name in names:
-            value = item.get(name)
-            if value not in (None, ""):
-                return value
-        return default
+def format_pidms_response(data):
 
     if isinstance(data, dict):
-        for key in ("result", "data", "keys", "products"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-        else:
-            data = [data]
+        data = [data]
 
     if not isinstance(data, list):
         return str(data)
 
-    result_blocks = []
+    result = []
 
     for item in data:
-        if not isinstance(item, dict):
-            result_blocks.append(str(item))
-            continue
+        key_value = item.get("keyname_with_dash") or item.get("keyname") or "Не найден"
+        description = item.get("prd") or "Не найдено"
+        subtype = item.get("sub") or "Не найдено"
+        error_code = item.get("errorcode")
+        time_value = item.get("datetime_checked_done") or "Не найдено"
+        remaining = item.get("remaining")
 
-        key_value = get_value(
-            item,
-            "keyname_with_dash",
-            "key",
-            "keyname",
-            "pid",
-            "product_key",
-            default="Не найден"
-        )
+        is_mak_with_remaining = remaining not in (None, -1, "-1")
 
-        description = get_value(
-            item,
-            "prd",
-            "description",
-            "Description",
-            "desc",
-            default="Не найдено"
-        )
+        text_lines = [
+            f"Key: {key_value}",
+            f"Description: {description}",
+            f"Sub type: {subtype}",
+        ]
 
-        subtype = get_value(
-            item,
-            "sub",
-            "subtype",
-            "sub_type",
-            "SubType",
-            "sku",
-            default="Не найдено"
-        )
+        if is_mak_with_remaining:
+            text_lines.append(f"Remaining: {remaining}")
+        else:
+            text_lines.append(f"Error code: {error_code or 'Не найдено'}")
 
-        error_code = get_value(
-            item,
-            "errorcode",
-            "error_code",
-            "ErrorCode",
-            "error",
-            default="Не найдено"
-        )
+        text_lines.append(f"Time: {time_value}")
 
-        time_value = get_value(
-            item,
-            "datetime_checked_done",
-            "time",
-            "Time",
-            "date",
-            "checked_time",
-            default="Не найдено"
-        )
+        result.append("\n".join(text_lines))
 
-        block = (
-            f"Key: {key_value}\n"
-            f"Description: {description}\n"
-            f"Sub type: {subtype}\n"
-            f"Error code: {error_code}\n"
-            f"Time: {time_value}"
-        )
-
-        result_blocks.append(block)
-
-    return "\n\n".join(result_blocks)
+    return "\n\n".join(result)
 
 async def process_activation(message: Message, iid: str, source: str):
     user_id = message.from_user.id
