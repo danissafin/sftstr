@@ -1,33 +1,36 @@
 import asyncio
+import base64
 import io
 import logging
 import os
-import platform
 import re
 from typing import Optional
 
 import aiohttp
 import asyncpg
-import pytesseract
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message
 from dotenv import load_dotenv
-from PIL import Image, ImageEnhance, ImageStat
 
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMINS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip().isdigit()}
 
-API_URL = "https://pidkey.com/ajax/cidms_api"
+ADMINS = {
+    int(x)
+    for x in os.getenv("ADMINS", "").split(",")
+    if x.strip().isdigit()
+}
+
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "5"))
 
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-else:
-    os.environ.setdefault("TESSDATA_PREFIX", "/usr/share/tesseract-ocr/5/tessdata/")
+CIDMS_API_URL = "https://pidkey.com/ajax/cidms_api"
+CIDMS_IMAGE_API_URL = "https://pidkey.com/ajax/cidms_via_image_base64_string_api"
+PIDMS_API_URL = "https://pidkey.com/ajax/pidms_api"
+
+CHECK_KEYS_ADMINS_ONLY = True
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,30 +50,9 @@ dp.include_router(router)
 db_pool: Optional[asyncpg.Pool] = None
 
 
-def extract_installation_code(text: str) -> Optional[str]:
-    sequences = re.findall(r"\d+", text)
-
-    seq7 = [s for s in sequences if len(s) == 7]
-    if len(seq7) >= 9:
-        code = "".join(seq7[:9])
-        if len(code) == 63:
-            return code
-
-    seq9 = [s for s in sequences if len(s) == 9]
-    if len(seq9) >= 7:
-        code = "".join(seq9[:7])
-        if len(code) == 63:
-            return code
-
-    for s in sequences:
-        if len(s) in (63, 48):
-            return s
-
-    all_digits = re.sub(r"\D", "", text)
-    if len(all_digits) in (63, 48):
-        return all_digits
-
-    return None
+def extract_product_keys(text: str) -> list[str]:
+    pattern = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
+    return re.findall(pattern, text.upper())
 
 
 async def init_db():
@@ -151,21 +133,86 @@ async def check_limit(user_id: int) -> bool:
     return activations < limit
 
 
-async def request_cid(iid: str) -> dict:
+async def request_cid_by_iid(iid: str) -> dict:
     params = {
         "iids": iid,
         "justforcheck": 0,
         "apikey": API_KEY,
     }
 
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=60)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(API_URL, params=params) as response:
+        async with session.get(CIDMS_API_URL, params=params) as response:
             if response.status != 200:
-                raise RuntimeError(f"API status: {response.status}")
+                raise RuntimeError(f"CIDMS status: {response.status}")
 
             return await response.json(content_type=None)
+
+
+async def request_cid_via_image(image_bytes: bytes) -> dict:
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "apikey": API_KEY,
+        "imagebase64string": image_base64,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=120)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(CIDMS_IMAGE_API_URL, json=payload) as response:
+            if response.status != 200:
+                raise RuntimeError(f"CIDMS image status: {response.status}")
+
+            return await response.json(content_type=None)
+
+
+async def check_product_keys(keys: list[str]) -> dict:
+    keys_text = "\r\n".join(keys)
+
+    params = {
+        "keys": keys_text,
+        "justgetdescription": 0,
+        "apikey": API_KEY,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=120)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(PIDMS_API_URL, params=params) as response:
+            if response.status != 200:
+                raise RuntimeError(f"PIDMS status: {response.status}")
+
+            return await response.json(content_type=None)
+
+
+def format_pidms_response(data) -> str:
+    if isinstance(data, list):
+        lines = []
+
+        for item in data:
+            key = item.get("key") or item.get("pid") or "Ключ"
+            description = item.get("description") or item.get("desc") or "Описание не найдено"
+            error = item.get("error") or item.get("errorcode") or ""
+            remaining = item.get("remaining") or item.get("remain") or ""
+
+            line = f"{key}\n{description}"
+
+            if remaining != "":
+                line += f"\nОстаток: {remaining}"
+
+            if error:
+                line += f"\nОшибка: {error}"
+
+            lines.append(line)
+
+        return "\n\n".join(lines)
+
+    if isinstance(data, dict):
+        return str(data)
+
+    return str(data)
 
 
 async def process_activation(message: Message, iid: str, source: str):
@@ -178,10 +225,10 @@ async def process_activation(message: Message, iid: str, source: str):
     await message.answer("Обрабатываю запрос...")
 
     try:
-        data = await request_cid(iid)
-        logger.info(f"API response: {data}")
+        data = await request_cid_by_iid(iid)
+        logger.info(f"CIDMS response: {data}")
     except Exception:
-        logger.exception("Ошибка обращения к API")
+        logger.exception("Ошибка обращения к CIDMS API")
         await message.answer("Ошибка при обращении к API. Попробуйте позже.")
         return
 
@@ -206,84 +253,84 @@ async def process_activation(message: Message, iid: str, source: str):
         )
         return
 
-    confirmation_id = data.get("confirmationid")
+    confirmation_id = data.get("confirmationid") or data.get("confirmation_id_with_dash")
 
     if not confirmation_id:
         await message.answer("CID не найден. Попробуйте позже или свяжитесь с нами.")
         return
 
     await add_activation(user_id, confirmation_id)
-    await message.answer(f"Ваш Confirmation ID: {confirmation_id}")
+    await message.answer(f"Ваш Confirmation ID:\n{confirmation_id}")
 
 
-def preprocess_images(image: Image.Image) -> list[Image.Image]:
-    image = image.convert("L")
+async def process_activation_image(message: Message, image_bytes: bytes):
+    user_id = message.from_user.id
 
-    stat = ImageStat.Stat(image)
-    avg_brightness = stat.mean[0]
-    logger.info(f"Средняя яркость изображения: {avg_brightness:.2f}")
+    if not await check_limit(user_id):
+        await message.answer("Вы достигли лимита успешных активаций. Свяжитесь с нами для увеличения лимита.")
+        return
 
-    images = []
+    await message.answer("Обрабатываю фото через PIDKey...")
 
-    contrast = ImageEnhance.Contrast(image).enhance(2.0)
-    images.append(contrast)
+    try:
+        data = await request_cid_via_image(image_bytes)
+        logger.info(f"CIDMS image response: {data}")
+    except Exception:
+        logger.exception("Ошибка обращения к CIDMS image API")
+        await message.answer("Ошибка при обработке изображения через API. Попробуйте позже.")
+        return
 
-    binary = contrast.point(lambda x: 0 if x < 150 else 255, "1")
-    images.append(binary)
+    short_result = data.get("short_result")
 
-    inverted = Image.eval(contrast, lambda x: 255 - x)
-    images.append(inverted)
+    if short_result == "IID is not correct!!":
+        await message.answer(
+            "Я где-то некорректно прочитал код установки, пожалуйста, предоставьте скриншот четче "
+            "или введите код установки вручную"
+        )
+        return
 
-    return images
+    if short_result == "Key blocked!":
+        await message.answer(
+            "К сожалению, мы не смогли проверить Ваш код установки в автоматическом режиме. "
+            "Пожалуйста, свяжитесь с нами и мы обязательно Вам поможем."
+        )
+        return
 
+    confirmation_id = data.get("confirmationid") or data.get("confirmation_id_with_dash")
 
-def ocr_image(image: Image.Image) -> str:
-    configs = [
-        "--psm 6",
-        "--psm 7",
-        "--psm 11",
-        "--psm 12",
-    ]
+    if not confirmation_id:
+        await message.answer("Не удалось получить Confirmation ID по фото. Попробуйте отправить скриншот чётче.")
+        return
 
-    langs = ["rus+eng", "eng", "rus"]
+    await add_activation(user_id, confirmation_id)
 
-    best_text = ""
+    iid_detected = data.get("iid_detected")
 
-    for prepared_image in preprocess_images(image):
-        for lang in langs:
-            for config in configs:
-                try:
-                    text = pytesseract.image_to_string(prepared_image, lang=lang, config=config)
-                    logger.info(f"OCR lang={lang}, config={config}:\n{text}")
-
-                    if len(text) > len(best_text):
-                        best_text = text
-
-                    code = extract_installation_code(text)
-                    if code:
-                        return text
-
-                except Exception:
-                    logger.exception(f"Ошибка OCR lang={lang}, config={config}")
-
-    return best_text
+    if iid_detected:
+        await message.answer(
+            f"Распознанный IID:\n{iid_detected}\n\n"
+            f"Ваш Confirmation ID:\n{confirmation_id}"
+        )
+    else:
+        await message.answer(f"Ваш Confirmation ID:\n{confirmation_id}")
 
 
 @router.message(F.text == "/start")
 async def start_command(message: Message):
     await message.answer(
-        "Привет! Отправь мне код IID текстом или пришли фото окна активации. "
-        "Я проверю код и пришлю Confirmation ID."
+        "Привет! Отправь мне код IID текстом или фото окна активации — я пришлю Confirmation ID.\n\n"
+        "Также администратор может отправить ключи Windows/Office для проверки через PIDKey."
     )
 
 
 @router.message(F.text == "/help")
 async def help_command(message: Message):
     await message.answer(
-        "Можно отправить:\n"
-        "1. Код установки текстом — 63 или 48 цифр.\n"
-        "2. Фото окна активации.\n\n"
-        "Команда администратора:\n"
+        "Что можно отправить:\n\n"
+        "1. Код установки IID текстом — 63 или 48 цифр.\n"
+        "2. Фото окна активации.\n"
+        "3. Ключи формата XXXXX-XXXXX-XXXXX-XXXXX-XXXXX для проверки через PIDKey.\n\n"
+        "Команды администратора:\n"
         "/setlimit USER_ID LIMIT"
     )
 
@@ -309,17 +356,6 @@ async def set_limit_command(message: Message):
     await message.answer(f"Лимит для пользователя {target_user_id} изменён на {new_limit} активаций.")
 
 
-@router.message(F.text)
-async def process_text(message: Message):
-    iid = re.sub(r"\D", "", message.text)
-
-    if len(iid) not in (63, 48):
-        await message.answer("Ошибка: код должен содержать 63 или 48 цифр. Проверьте ввод и попробуйте снова.")
-        return
-
-    await process_activation(message, iid, source="text")
-
-
 @router.message(F.photo)
 async def process_photo(message: Message):
     photo = message.photo[-1]
@@ -327,33 +363,56 @@ async def process_photo(message: Message):
     try:
         file_info = await bot.get_file(photo.file_id)
         content = await bot.download_file(file_info.file_path)
-        photo_bytes = content if isinstance(content, io.BytesIO) else io.BytesIO(content)
-        photo_bytes.seek(0)
-        image = Image.open(photo_bytes)
+
+        if isinstance(content, io.BytesIO):
+            image_bytes = content.getvalue()
+        else:
+            image_bytes = content
+
     except Exception:
-        logger.exception("Ошибка скачивания или открытия изображения")
-        await message.answer("Не удалось открыть изображение. Попробуйте отправить фото ещё раз.")
+        logger.exception("Ошибка скачивания изображения")
+        await message.answer("Не удалось скачать изображение. Попробуйте отправить фото ещё раз.")
         return
 
-    try:
-        ocr_text = await asyncio.to_thread(ocr_image, image)
-        logger.info(f"Лучший OCR текст:\n{ocr_text}")
-    except Exception:
-        logger.exception("Ошибка распознавания изображения")
-        await message.answer("Ошибка при распознавании изображения. Попробуйте позже.")
+    await process_activation_image(message, image_bytes)
+
+
+@router.message(F.text)
+async def process_text(message: Message):
+    text = message.text.strip()
+
+    product_keys = extract_product_keys(text)
+
+    if product_keys:
+        if CHECK_KEYS_ADMINS_ONLY and message.from_user.id not in ADMINS:
+            await message.answer("Проверка ключей доступна только администратору.")
+            return
+
+        await message.answer(f"Проверяю ключи: {len(product_keys)} шт...")
+
+        try:
+            data = await check_product_keys(product_keys)
+            logger.info(f"PIDMS response: {data}")
+        except Exception:
+            logger.exception("Ошибка обращения к PIDMS API")
+            await message.answer("Ошибка при проверке ключей через PIDKey. Попробуйте позже.")
+            return
+
+        result_text = format_pidms_response(data)
+
+        if len(result_text) > 3900:
+            result_text = result_text[:3900] + "\n\nОтвет слишком длинный, часть результата обрезана."
+
+        await message.answer(f"Ответ PIDKey:\n\n{result_text}")
         return
 
-    iid = extract_installation_code(ocr_text)
+    iid = re.sub(r"\D", "", text)
 
-    if not iid:
-        await message.answer(
-            "Не удалось распознать корректный код установки из изображения. "
-            "Попробуйте отправить более чёткий скриншот или введите код вручную."
-        )
+    if len(iid) not in (63, 48):
+        await message.answer("Ошибка: код должен содержать 63 или 48 цифр. Проверьте ввод и попробуйте снова.")
         return
 
-    logger.info(f"Распознанный IID: {iid}")
-    await process_activation(message, iid, source="photo")
+    await process_activation(message, iid, source="text")
 
 
 async def main():
