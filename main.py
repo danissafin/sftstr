@@ -716,10 +716,10 @@ async def process_text(message: Message):
         try:
             data = await check_product_keys(product_keys)
 
-logger.info("=" * 100)
-logger.info("PIDMS RAW RESPONSE:")
-logger.info(str(data))
-logger.info("=" * 100)
+            logger.info("=" * 100)
+            logger.info("PIDMS RAW RESPONSE:")
+            logger.info(str(data))
+            logger.info("=" * 100)
         except Exception:
             logger.exception("Ошибка обращения к PIDMS API")
             await message.answer("Ошибка при проверке ключей через PIDKey. Попробуйте позже.")
