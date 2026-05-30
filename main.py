@@ -318,8 +318,9 @@ async def check_product_keys(keys: list[str]) -> dict:
 def format_pidms_response(data) -> str:
     def get_value(item: dict, *names, default=""):
         for name in names:
-            if name in item and item[name] not in (None, ""):
-                return item[name]
+            value = item.get(name)
+            if value not in (None, ""):
+                return value
         return default
 
     if isinstance(data, dict):
@@ -340,14 +341,56 @@ def format_pidms_response(data) -> str:
             result_blocks.append(str(item))
             continue
 
-        key = get_value(item, "key", "pid", "product_key", default="Не найден")
-        description = get_value(item, "description", "Description", "desc", default="Не найдено")
-        subtype = get_value(item, "subtype", "sub_type", "SubType", "sku", default="Не найдено")
-        error_code = get_value(item, "errorcode", "error_code", "ErrorCode", "error", default="Не найдено")
-        time_value = get_value(item, "time", "Time", "date", "checked_time", default="Не найдено")
+        key_value = get_value(
+            item,
+            "keyname_with_dash",
+            "key",
+            "keyname",
+            "pid",
+            "product_key",
+            default="Не найден"
+        )
+
+        description = get_value(
+            item,
+            "prd",
+            "description",
+            "Description",
+            "desc",
+            default="Не найдено"
+        )
+
+        subtype = get_value(
+            item,
+            "sub",
+            "subtype",
+            "sub_type",
+            "SubType",
+            "sku",
+            default="Не найдено"
+        )
+
+        error_code = get_value(
+            item,
+            "errorcode",
+            "error_code",
+            "ErrorCode",
+            "error",
+            default="Не найдено"
+        )
+
+        time_value = get_value(
+            item,
+            "datetime_checked_done",
+            "time",
+            "Time",
+            "date",
+            "checked_time",
+            default="Не найдено"
+        )
 
         block = (
-            f"Key: {key}\n"
+            f"Key: {key_value}\n"
             f"Description: {description}\n"
             f"Sub type: {subtype}\n"
             f"Error code: {error_code}\n"
@@ -357,7 +400,6 @@ def format_pidms_response(data) -> str:
         result_blocks.append(block)
 
     return "\n\n".join(result_blocks)
-
 
 async def process_activation(message: Message, iid: str, source: str):
     user_id = message.from_user.id
