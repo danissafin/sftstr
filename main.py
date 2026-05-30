@@ -15,7 +15,15 @@ import asyncpg
 import cv2
 import numpy as np
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BufferedInputFile,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,7 +32,12 @@ TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "5"))
-ADMINS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip().isdigit()}
+
+ADMINS = {
+    int(x)
+    for x in os.getenv("ADMINS", "").split(",")
+    if x.strip().isdigit()
+}
 
 CIDMS_API_URL = "https://pidkey.com/ajax/cidms_api"
 CIDMS_IMAGE_API_URL = "https://pidkey.com/ajax/cidms_via_image_base64_string_api"
@@ -75,9 +88,14 @@ def check_flood(user_id: int) -> bool:
     return True
 
 
-def extract_product_keys(text: str) -> list[str]:
-    pattern = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
-    return re.findall(pattern, text.upper())
+def user_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Мой профиль")],
+            [KeyboardButton(text="ℹ️ Помощь")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -91,6 +109,11 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def extract_product_keys(text: str) -> list[str]:
+    pattern = r"[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}"
+    return re.findall(pattern, text.upper())
+
+
 async def init_db():
     global db_pool
 
@@ -101,6 +124,16 @@ async def init_db():
     )
 
     async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_limits (
                 user_id BIGINT PRIMARY KEY,
@@ -130,11 +163,60 @@ async def init_db():
         """)
 
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cid_cache (
+                iid TEXT PRIMARY KEY,
+                confirmation_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await conn.execute("""
             INSERT INTO activation_logs (user_id, confirmation_id, source)
             SELECT user_id, confirmation_id, 'legacy'
             FROM user_activations
             ON CONFLICT DO NOTHING
         """)
+
+
+async def save_user(message: Message):
+    user = message.from_user
+    if not user:
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, last_name, updated_at)
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+        )
+
+
+async def resolve_user_id(value: str):
+    value = value.strip()
+
+    if value.isdigit():
+        return int(value)
+
+    username = value.replace("@", "").lower()
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM users WHERE LOWER(username) = $1",
+            username,
+        )
+
+    return row["user_id"] if row else None
 
 
 async def get_user_limit(user_id: int) -> int:
@@ -200,6 +282,29 @@ async def check_limit(user_id: int) -> bool:
     return activations < limit
 
 
+async def get_cached_cid(iid: str):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT confirmation_id FROM cid_cache WHERE iid = $1",
+            iid,
+        )
+        return row["confirmation_id"] if row else None
+
+
+async def save_cached_cid(iid: str, confirmation_id: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO cid_cache (iid, confirmation_id)
+            VALUES ($1, $2)
+            ON CONFLICT (iid)
+            DO UPDATE SET confirmation_id = EXCLUDED.confirmation_id
+            """,
+            iid,
+            confirmation_id,
+        )
+
+
 async def get_stats() -> dict:
     async with db_pool.acquire() as conn:
         users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM activation_logs")
@@ -210,6 +315,37 @@ async def get_stats() -> dict:
         "users": users or 0,
         "activations": activations or 0,
         "users_with_limits": users_with_limits or 0,
+    }
+
+
+async def get_period_stats() -> dict:
+    async with db_pool.acquire() as conn:
+        today = await conn.fetchval("""
+            SELECT COUNT(*) FROM activation_logs
+            WHERE created_at >= CURRENT_DATE
+        """)
+
+        yesterday = await conn.fetchval("""
+            SELECT COUNT(*) FROM activation_logs
+            WHERE created_at >= CURRENT_DATE - INTERVAL '1 day'
+              AND created_at < CURRENT_DATE
+        """)
+
+        week = await conn.fetchval("""
+            SELECT COUNT(*) FROM activation_logs
+            WHERE created_at >= NOW() - INTERVAL '7 days'
+        """)
+
+        month = await conn.fetchval("""
+            SELECT COUNT(*) FROM activation_logs
+            WHERE created_at >= NOW() - INTERVAL '30 days'
+        """)
+
+    return {
+        "today": today or 0,
+        "yesterday": yesterday or 0,
+        "week": week or 0,
+        "month": month or 0,
     }
 
 
@@ -265,11 +401,8 @@ def improve_image_with_opencv(image_bytes: bytes) -> bytes:
     if img is None:
         return image_bytes
 
-    scale = 2
-    img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
+    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -352,8 +485,16 @@ def format_pidms_response(data):
 
     return "\n\n".join(result)
 
+
 async def process_activation(message: Message, iid: str, source: str):
     user_id = message.from_user.id
+
+    cached_cid = await get_cached_cid(iid)
+
+    if cached_cid:
+        await add_activation(user_id, cached_cid, iid=iid, source="cache")
+        await message.answer(f"CID найден в базе:\n{cached_cid}")
+        return
 
     if not await check_limit(user_id):
         await message.answer("Вы достигли лимита успешных активаций. Свяжитесь с нами для увеличения лимита.")
@@ -388,7 +529,9 @@ async def process_activation(message: Message, iid: str, source: str):
         await message.answer("CID не найден. Попробуйте позже или свяжитесь с нами.")
         return
 
+    await save_cached_cid(iid, confirmation_id)
     await add_activation(user_id, confirmation_id, iid=iid, source=source)
+
     await message.answer(f"Ваш Confirmation ID:\n{confirmation_id}")
 
 
@@ -432,6 +575,9 @@ async def process_activation_image(message: Message, image_bytes: bytes):
         await message.answer("Не удалось получить Confirmation ID по фото. Попробуйте отправить скриншот чётче.")
         return
 
+    if iid_detected:
+        await save_cached_cid(iid_detected, confirmation_id)
+
     await add_activation(user_id, confirmation_id, iid=iid_detected, source="photo")
 
     if iid_detected:
@@ -445,13 +591,20 @@ async def process_activation_image(message: Message, image_bytes: bytes):
 
 async def create_backup_file() -> BufferedInputFile:
     async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT * FROM users ORDER BY updated_at DESC")
         limits = await conn.fetch("SELECT * FROM user_limits ORDER BY user_id")
         activations = await conn.fetch("SELECT * FROM activation_logs ORDER BY created_at DESC")
+        cache = await conn.fetch("SELECT * FROM cid_cache ORDER BY created_at DESC")
 
     output = io.StringIO()
-
-    output.write("user_limits\n")
     writer = csv.writer(output)
+
+    output.write("users\n")
+    writer.writerow(["user_id", "username", "first_name", "last_name", "updated_at"])
+    for row in users:
+        writer.writerow([row["user_id"], row["username"], row["first_name"], row["last_name"], row["updated_at"]])
+
+    output.write("\nuser_limits\n")
     writer.writerow(["user_id", "limit_value"])
     for row in limits:
         writer.writerow([row["user_id"], row["limit_value"]])
@@ -459,14 +612,12 @@ async def create_backup_file() -> BufferedInputFile:
     output.write("\nactivation_logs\n")
     writer.writerow(["id", "user_id", "iid", "confirmation_id", "source", "created_at"])
     for row in activations:
-        writer.writerow([
-            row["id"],
-            row["user_id"],
-            row["iid"],
-            row["confirmation_id"],
-            row["source"],
-            row["created_at"],
-        ])
+        writer.writerow([row["id"], row["user_id"], row["iid"], row["confirmation_id"], row["source"], row["created_at"]])
+
+    output.write("\ncid_cache\n")
+    writer.writerow(["iid", "confirmation_id", "created_at"])
+    for row in cache:
+        writer.writerow([row["iid"], row["confirmation_id"], row["created_at"]])
 
     data = output.getvalue().encode("utf-8-sig")
     filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
@@ -475,10 +626,9 @@ async def create_backup_file() -> BufferedInputFile:
 
 
 async def send_backup_to_admins():
-    file = await create_backup_file()
-
     for admin_id in ADMINS:
         try:
+            file = await create_backup_file()
             await bot.send_document(admin_id, file, caption="Ежедневная резервная копия БД")
         except Exception:
             logger.exception(f"Не удалось отправить бэкап админу {admin_id}")
@@ -502,31 +652,57 @@ async def daily_backup_task():
 
 @router.message(F.text == "/start")
 async def start_command(message: Message):
+    await save_user(message)
+
     await message.answer(
         "Привет! Отправь мне код IID, и я проверю его через CIDMS API. "
-        "Код должен содержать 63 или 48 цифр."
+        "Код должен содержать 63 или 48 цифр.",
+        reply_markup=user_keyboard(),
     )
 
 
-@router.message(F.text == "/help")
+@router.message((F.text == "/help") | (F.text == "ℹ️ Помощь"))
 async def help_command(message: Message):
+    await save_user(message)
+
     await message.answer(
         "Можно отправить:\n"
         "1. Код установки IID — 63 или 48 цифр.\n"
         "2. Фото окна активации.\n"
         "3. Ключи Windows/Office для проверки, если вы администратор.\n\n"
+        "Пользовательские команды:\n"
+        "/profile — мой профиль\n\n"
         "Админ-команды:\n"
         "/admin — админ-панель\n"
         "/stats — статистика\n"
-        "/user USER_ID — информация о пользователе\n"
-        "/history USER_ID — история активаций\n"
+        "/user @username или USER_ID — информация о пользователе\n"
+        "/history @username или USER_ID — история активаций\n"
         "/backup — резервная копия БД\n"
-        "/setlimit USER_ID LIMIT — изменить лимит"
+        "/export — экспорт активаций\n"
+        "/setlimit @username или USER_ID LIMIT — изменить лимит"
+    )
+
+
+@router.message((F.text == "/profile") | (F.text == "👤 Мой профиль"))
+async def profile_command(message: Message):
+    await save_user(message)
+
+    user_id = message.from_user.id
+    info = await get_user_info(user_id)
+
+    await message.answer(
+        f"👤 Ваш профиль\n\n"
+        f"Ваш ID: {user_id}\n"
+        f"Лимит активаций: {info['limit']}\n"
+        f"Использовано: {info['used']}\n"
+        f"Осталось: {info['left']}"
     )
 
 
 @router.message(F.text == "/admin")
 async def admin_panel(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав администратора.")
         return
@@ -541,12 +717,17 @@ async def admin_stats_callback(callback: CallbackQuery):
         return
 
     stats = await get_stats()
+    period = await get_period_stats()
 
     await callback.message.answer(
         f"📊 Статистика:\n\n"
         f"Количество пользователей: {stats['users']}\n"
         f"Количество активаций: {stats['activations']}\n"
-        f"Пользователей с индивидуальными лимитами: {stats['users_with_limits']}"
+        f"Пользователей с индивидуальными лимитами: {stats['users_with_limits']}\n\n"
+        f"Сегодня: {period['today']}\n"
+        f"Вчера: {period['yesterday']}\n"
+        f"За 7 дней: {period['week']}\n"
+        f"За 30 дней: {period['month']}"
     )
 
     await callback.answer()
@@ -565,37 +746,52 @@ async def admin_backup_callback(callback: CallbackQuery):
 
 @router.message(F.text == "/stats")
 async def stats_command(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав администратора.")
         return
 
     stats = await get_stats()
+    period = await get_period_stats()
 
     await message.answer(
         f"📊 Статистика:\n\n"
         f"Количество пользователей: {stats['users']}\n"
         f"Количество активаций: {stats['activations']}\n"
-        f"Пользователей с индивидуальными лимитами: {stats['users_with_limits']}"
+        f"Пользователей с индивидуальными лимитами: {stats['users_with_limits']}\n\n"
+        f"Сегодня: {period['today']}\n"
+        f"Вчера: {period['yesterday']}\n"
+        f"За 7 дней: {period['week']}\n"
+        f"За 30 дней: {period['month']}"
     )
 
 
 @router.message(F.text.startswith("/user"))
 async def user_command(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав администратора.")
         return
 
     parts = message.text.split()
 
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Использование: /user USER_ID")
+    if len(parts) != 2:
+        await message.answer("Использование: /user @username или /user USER_ID")
         return
 
-    user_id = int(parts[1])
+    user_id = await resolve_user_id(parts[1])
+
+    if not user_id:
+        await message.answer("Пользователь не найден. Он должен хотя бы раз написать боту.")
+        return
+
     info = await get_user_info(user_id)
 
     await message.answer(
-        f"👤 Пользователь: {info['user_id']}\n"
+        f"👤 Пользователь: {parts[1]}\n"
+        f"ID: {user_id}\n"
         f"Лимит: {info['limit']}\n"
         f"Использовано: {info['used']}\n"
         f"Осталось: {info['left']}"
@@ -604,17 +800,24 @@ async def user_command(message: Message):
 
 @router.message(F.text.startswith("/history"))
 async def history_command(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав администратора.")
         return
 
     parts = message.text.split()
 
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Использование: /history USER_ID")
+    if len(parts) != 2:
+        await message.answer("Использование: /history @username или /history USER_ID")
         return
 
-    user_id = int(parts[1])
+    user_id = await resolve_user_id(parts[1])
+
+    if not user_id:
+        await message.answer("Пользователь не найден. Он должен хотя бы раз написать боту.")
+        return
+
     rows = await get_user_history(user_id, limit=10)
 
     if not rows:
@@ -641,6 +844,8 @@ async def history_command(message: Message):
 
 @router.message(F.text == "/backup")
 async def backup_command(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав администратора.")
         return
@@ -649,27 +854,48 @@ async def backup_command(message: Message):
     await message.answer_document(file, caption="Резервная копия БД")
 
 
+@router.message(F.text == "/export")
+async def export_command(message: Message):
+    await save_user(message)
+
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав администратора.")
+        return
+
+    file = await create_backup_file()
+    await message.answer_document(file, caption="Экспорт активаций")
+
+
 @router.message(F.text.startswith("/setlimit"))
 async def set_limit_command(message: Message):
+    await save_user(message)
+
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав для изменения лимитов.")
         return
 
     parts = message.text.split()
 
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        await message.answer("Использование: /setlimit USER_ID LIMIT")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await message.answer("Использование: /setlimit @username LIMIT или /setlimit USER_ID LIMIT")
         return
 
-    target_user_id = int(parts[1])
+    target_user_id = await resolve_user_id(parts[1])
+
+    if not target_user_id:
+        await message.answer("Пользователь не найден. Он должен хотя бы раз написать боту.")
+        return
+
     new_limit = int(parts[2])
 
     await set_user_limit(target_user_id, new_limit)
-    await message.answer(f"Лимит для пользователя {target_user_id} изменён на {new_limit} активаций.")
+    await message.answer(f"Лимит для пользователя {parts[1]} изменён на {new_limit} активаций.")
 
 
 @router.message(F.photo)
 async def process_photo(message: Message):
+    await save_user(message)
+
     if not check_flood(message.from_user.id):
         await message.answer("Слишком много запросов. Подождите немного и попробуйте снова.")
         return
@@ -679,7 +905,6 @@ async def process_photo(message: Message):
     try:
         file_info = await bot.get_file(photo.file_id)
         content = await bot.download_file(file_info.file_path)
-
         image_bytes = content.getvalue() if isinstance(content, io.BytesIO) else content
 
     except Exception:
@@ -692,6 +917,8 @@ async def process_photo(message: Message):
 
 @router.message(F.text)
 async def process_text(message: Message):
+    await save_user(message)
+
     if not check_flood(message.from_user.id):
         await message.answer("Слишком много запросов. Подождите немного и попробуйте снова.")
         return
@@ -708,6 +935,7 @@ async def process_text(message: Message):
 
         try:
             data = await check_product_keys(product_keys)
+            logger.info(f"PIDMS response: {data}")
         except Exception:
             logger.exception("Ошибка обращения к PIDMS API")
             await message.answer("Ошибка при проверке ключей через PIDKey. Попробуйте позже.")
