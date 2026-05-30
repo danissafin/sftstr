@@ -2,3 +2,5 @@ aiogram
 aiohttp
 asyncpg
 python-dotenv
+opencv-python-headless
+numpy
